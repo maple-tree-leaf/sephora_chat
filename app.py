@@ -64,17 +64,33 @@ with st.sidebar:
 # ----------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_pipeline(data_dir, use_llm_tagger, llm_model, force_rebuild):
-    if force_rebuild or not os.path.exists(core.SAMPLE_PATH):
+    have_raw_data = os.path.exists(os.path.join(data_dir, "product_info.csv"))
+
+    if force_rebuild and have_raw_data:
+        # Full rebuild from raw CSVs — only possible when the raw dataset
+        # actually exists on disk (e.g. running locally with the real data/
+        # folder). On a cloud host this folder won't exist on purpose, since
+        # the full ~1M-row dataset is too large to commit to GitHub.
         raw, n_reviews, n_products = core.load_raw(data_dir)
         sample = core.build_sample(raw)
         sample.to_parquet(core.SAMPLE_PATH)
-    else:
+    elif os.path.exists(core.SAMPLE_PATH):
+        # No raw data available (or rebuild not requested) — use the
+        # pre-built sample that was committed to the repo. This is the path
+        # a cloud deployment should always take.
         sample = pd.read_parquet(core.SAMPLE_PATH)
+    else:
+        raise FileNotFoundError(
+            f"No raw data found at '{data_dir}' and no cached '{core.SAMPLE_PATH}' "
+            f"in the repo either. If running locally, point data_dir at your real "
+            f"dataset folder. If deployed, make sure sample_10k.parquet was committed "
+            f"to GitHub alongside app.py."
+        )
 
     aggs = core.build_aggregates(sample, use_llm_tagger=use_llm_tagger, llm_model=llm_model)
     categories = sample["primary_category"].dropna().unique().tolist()
 
-    if force_rebuild or not os.path.exists(core.CHROMA_DIR):
+    if (force_rebuild and have_raw_data) or not os.path.exists(core.CHROMA_DIR):
         model, collection = core.build_index(sample)
     else:
         try:
@@ -93,8 +109,8 @@ if rebuild:
         get_pipeline.clear()  # force a fresh build
         st.session_state.pipeline = get_pipeline(data_dir, use_llm_tagger, llm_model, True)
     st.success("Pipeline ready.")
-elif st.session_state.pipeline is None and os.path.exists(core.SAMPLE_PATH) and os.path.exists(core.CHROMA_DIR):
-    with st.spinner("Loading cached pipeline..."):
+elif st.session_state.pipeline is None and os.path.exists(core.SAMPLE_PATH):
+    with st.spinner("Loading cached sample and building/loading vector index..."):
         st.session_state.pipeline = get_pipeline(data_dir, use_llm_tagger, llm_model, False)
 
 # ----------------------------------------------------------------------
