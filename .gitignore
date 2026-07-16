@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+
+# Raw dataset (never committed — too large; app falls back to sample_1k.parquet)
+data/
+
+# Generated at runtime; safe to rebuild locally
+chroma_db/
+.cache/
+
+# Secrets
+.env
+.streamlit/secrets.toml
+
+.pytest_cache/
+.DS_Store
