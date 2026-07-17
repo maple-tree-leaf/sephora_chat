@@ -21,10 +21,12 @@ after that it's cached and you just chat.
 """
 
 import os
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
 
+import review_agent
 import sephora_core as core
 
 # If GROQ_API_KEY isn't set as an env var (typical when running locally),
@@ -163,7 +165,9 @@ if st.session_state.pipeline is None:
 
 sample, aggs, categories, model, collection, _, _ = st.session_state.pipeline
 
-tab_chat, tab_stats = st.tabs(["💬 Chat", "📊 Stats overview"])
+tab_chat, tab_stats, tab_outreach = st.tabs(
+    ["💬 Chat", "📊 Stats overview", "📣 Review outreach"]
+)
 
 with tab_stats:
     st.subheader("Sample summary")
@@ -289,3 +293,102 @@ with tab_chat:
         st.session_state.pending_question = None
         st.session_state.busy = False
         st.rerun()
+
+with tab_outreach:
+    st.subheader("Proactive review-solicitation agent")
+    st.caption(
+        "Simulate reaching out to a customer ~2 weeks after purchase. The agent "
+        "reads how past buyers reviewed the same product, turns the recurring "
+        "themes into targeted questions, and adapts as the customer replies until "
+        "it has a satisfactory, well-rounded review."
+    )
+
+    products = sorted(sample["product_name"].dropna().unique().tolist()) \
+        if "product_name" in sample.columns else []
+
+    setup_col, date_col = st.columns([2, 1])
+    with setup_col:
+        selected_product = st.selectbox(
+            "Product the customer purchased",
+            products or ["(no product names in sample)"],
+            disabled=not products,
+        )
+    with date_col:
+        default_purchase = date.today() - timedelta(days=review_agent.OUTREACH_MIN_DAYS)
+        purchase_date = st.date_input("Purchase date", value=default_purchase)
+
+    days = review_agent.days_since_purchase(purchase_date)
+    due = review_agent.is_due_for_outreach(purchase_date)
+    if due:
+        st.success(f"✅ Purchased {days} days ago — due for outreach "
+                   f"(threshold: {review_agent.OUTREACH_MIN_DAYS} days).")
+    else:
+        eta = review_agent.next_outreach_date(purchase_date)
+        st.info(f"⏳ Purchased {days} days ago — too soon. The agent would wait "
+                f"until {eta:%b %d, %Y} ({review_agent.OUTREACH_MIN_DAYS} days after purchase).")
+
+    if products:
+        insights = review_agent.product_review_insights(sample, product_name=selected_product)
+        with st.expander("What the database knows about this product", expanded=False):
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Past reviews used", insights["n_reviews"])
+            m2.metric("Avg rating", insights["avg_rating"] if insights["avg_rating"] is not None else "n/a")
+            m3.metric("Grounding scope", insights["scope"])
+            if insights["scope"] == "category":
+                st.caption("Too few product-specific reviews, so themes are drawn from the "
+                           "product's category instead.")
+            if insights["top_issues"]:
+                st.write("**Anticipated themes to probe:**")
+                for issue in insights["top_issues"][:review_agent.MAX_TALKING_POINTS]:
+                    st.write(f"- {issue} ({insights['issue_counts'][issue]} mentions)")
+            else:
+                st.write("No recurring negative themes found — the agent will keep it open-ended.")
+
+    # -- conversation state (kept separate from the analyst chat) -------
+    start_disabled = not products or not due
+    if st.button("Start outreach conversation", type="primary", disabled=start_disabled):
+        convo = review_agent.ReviewConversation(
+            review_agent.product_review_insights(sample, product_name=selected_product),
+            llm_model=llm_model,
+        )
+        first = convo.advance()
+        st.session_state.ro_convo = convo
+        st.session_state.ro_log = [("assistant", first["message"])]
+        st.session_state.ro_done = first["done"]
+        st.session_state.ro_draft = first.get("draft")
+        st.rerun()
+
+    if start_disabled and not due:
+        st.caption("Outreach is only offered once the 2-week threshold has passed. "
+                   "Pick an earlier purchase date to try it.")
+
+    convo = st.session_state.get("ro_convo")
+    if convo is not None:
+        for role, content in st.session_state.ro_log:
+            with st.chat_message("assistant" if role == "assistant" else "user"):
+                st.write(content)
+
+        if not st.session_state.get("ro_done"):
+            reply = st.chat_input("Reply as the customer...")
+            if reply:
+                convo.ingest_user_message(reply)
+                st.session_state.ro_log.append(("user", reply))
+                step = convo.advance()
+                st.session_state.ro_log.append(("assistant", step["message"]))
+                st.session_state.ro_done = step["done"]
+                st.session_state.ro_draft = step.get("draft")
+                st.rerun()
+        else:
+            draft = st.session_state.get("ro_draft")
+            if draft and not draft.get("declined"):
+                st.divider()
+                st.subheader("📝 Collected review draft")
+                d1, d2 = st.columns(2)
+                d1.metric("Suggested rating", f"{draft['suggested_rating']} / 5"
+                          if draft["suggested_rating"] else "n/a")
+                d2.metric("Overall sentiment", draft["sentiment"] or "n/a")
+                st.text_area("Review text", draft["text"], height=160)
+            if st.button("Reset conversation"):
+                for k in ("ro_convo", "ro_log", "ro_done", "ro_draft"):
+                    st.session_state.pop(k, None)
+                st.rerun()
